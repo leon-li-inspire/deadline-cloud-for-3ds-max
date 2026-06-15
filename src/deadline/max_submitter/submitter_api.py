@@ -33,7 +33,9 @@ class MaxSubmitterAPI(SubmitterAPI):
         settings = MaxSubmitterSettings()
         settings.name = rt.maxFileName or "Untitled"
         settings.project_path = rt.maxFilePath or ""
-        settings.input_filenames = [str(Path(rt.maxFilePath) / rt.maxFileName)] if rt.maxFileName else []
+        settings.input_filenames = (
+            [str(Path(rt.maxFilePath) / rt.maxFileName)] if rt.maxFileName else []
+        )
 
         anim_range = rt.animationRange
         start_frame = int(anim_range.start)
@@ -62,7 +64,6 @@ class MaxSubmitterAPI(SubmitterAPI):
         host_requirements: Optional[dict[str, Any]] = None,
     ) -> dict[str, Any]:
         from .create_job_bundle import get_job_template
-        from .data_classes import RenderSubmitterUISettings, StateSetData
 
         native_settings = self._to_native_settings(settings)
         state_sets = self._get_state_sets(settings)
@@ -71,9 +72,7 @@ class MaxSubmitterAPI(SubmitterAPI):
         with open(Path(__file__).parent / "default_max_job_template.yaml") as fh:
             default_job_template = yaml.safe_load(fh)
 
-        job_template = get_job_template(
-            default_job_template, native_settings, state_sets, cameras
-        )
+        job_template = get_job_template(default_job_template, native_settings, state_sets, cameras)
 
         if host_requirements:
             for step in job_template.get("steps", []):
@@ -87,7 +86,6 @@ class MaxSubmitterAPI(SubmitterAPI):
         queue_parameters: list[dict[str, Any]],
     ) -> list[dict[str, Any]]:
         from .create_job_bundle import get_parameters_values
-        from .data_classes import RenderSubmitterUISettings, StateSetData
 
         native_settings = self._to_native_settings(settings)
         state_sets = self._get_state_sets(settings)
