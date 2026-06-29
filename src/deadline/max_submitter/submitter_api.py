@@ -6,8 +6,12 @@ from pathlib import Path
 from typing import Any, Optional
 
 import yaml
+from pymxs import runtime as rt  # type: ignore[import]
 
+from deadline.client.job_bundle.submission import AssetReferences
 from deadline.client.submitter_api import SubmitterAPI, SubmitterSettings
+
+from .data_classes import RenderSubmitterUISettings, StateSetData
 
 
 @dataclass
@@ -28,8 +32,6 @@ class MaxSubmitterAPI(SubmitterAPI):
     """SubmitterAPI implementation for 3ds Max submissions."""
 
     def get_settings(self) -> MaxSubmitterSettings:
-        from pymxs import runtime as rt  # type: ignore[import]
-
         settings = MaxSubmitterSettings()
         settings.name = rt.maxFileName or "Untitled"
         settings.project_path = rt.maxFilePath or ""
@@ -93,9 +95,6 @@ class MaxSubmitterAPI(SubmitterAPI):
         return get_parameters_values(native_settings, state_sets, queue_parameters)
 
     def get_asset_references(self, settings: SubmitterSettings) -> dict[str, Any]:
-        from pymxs import runtime as rt  # type: ignore[import]
-        from deadline.client.job_bundle.submission import AssetReferences
-
         scene_file = str(Path(rt.maxFilePath) / rt.maxFileName) if rt.maxFileName else ""
 
         asset_refs = AssetReferences(
@@ -106,8 +105,6 @@ class MaxSubmitterAPI(SubmitterAPI):
         return asset_refs.to_dict()
 
     def _to_native_settings(self, settings: SubmitterSettings):
-        from .data_classes import RenderSubmitterUISettings
-
         native = RenderSubmitterUISettings()
         native.name = settings.name
         native.priority = settings.priority
@@ -115,15 +112,39 @@ class MaxSubmitterAPI(SubmitterAPI):
         native.max_failed_tasks_count = settings.max_failed_tasks_count
         native.max_retries_per_task = settings.max_retries_per_task
 
+        # Carry over the common SubmitterSettings so they reach the job template
+        # and parameter values. Without this, project/output paths come through
+        # empty and the frame range falls back to defaults.
+        native.frame_list = settings.frame_list or native.frame_list
+        native.project_path = settings.project_path or native.project_path
+        native.output_path = settings.output_path or native.output_path
+        native.input_filenames = settings.input_filenames or native.input_filenames
+        native.input_directories = settings.input_directories or native.input_directories
+        native.output_directories = settings.output_directories or native.output_directories
+
+        # The batch-render parameter builder only honours frame_list when the
+        # override flag is set; otherwise it reads the scene's frame range.
+        # Respect an explicit frame_list by enabling the override.
+        native.override_frame_range = settings.override_frame_range or bool(settings.frame_list)
+
         if isinstance(settings, MaxSubmitterSettings):
             native.description = settings.description
+            # Renderer is required by the adaptor schema and is written verbatim
+            # into the step init-data. Without this it stays empty and the render
+            # fails. get_settings() populates it from the active scene renderer.
+            native.renderer = settings.renderer or native.renderer
+            # Only override the camera selection when a specific camera was chosen.
+            # An empty value must NOT be propagated: the native default is
+            # ALL_CAMERAS_STR, and the job template only adds a "Camera" parameter
+            # when camera_selection != ALL_CAMERAS_STR. Copying "" would emit a
+            # Camera parameter whose value is outside the template's allowedValues
+            # and the CreateJob call fails with a ValidationException.
+            if settings.camera_selection:
+                native.camera_selection = settings.camera_selection
 
         return native
 
     def _get_state_sets(self, settings: SubmitterSettings):
-        from pymxs import runtime as rt  # type: ignore[import]
-        from .data_classes import StateSetData
-
         anim_range = rt.animationRange
         frame_range = f"{int(anim_range.start)}-{int(anim_range.end)}"
         output_path = rt.rendOutputFilename or ""
@@ -146,8 +167,6 @@ class MaxSubmitterAPI(SubmitterAPI):
         ]
 
     def _get_cameras(self):
-        from pymxs import runtime as rt  # type: ignore[import]
-
         cameras = []
         for obj in rt.cameras:
             cameras.append(str(obj.name))
