@@ -24,10 +24,18 @@ from data_const import (
     TEMP_BACKUP_FILENAME,
     UI_GROUP_LABEL,
 )
+from deadline.client.config import get_setting, str2bool
 from deadline.client.dataclasses import SubmitterInfo
+from deadline.client.exceptions import DeadlineOperationCanceled, DeadlineOperationError
 from deadline.client.job_bundle._yaml import deadline_yaml_dump
 from deadline.client.job_bundle.submission import AssetReferences
 from deadline.client.ui.dialogs._types import JobBundlePurpose
+from deadline.client.ui.pre_gui_hooks import (
+    PreGuiHookContext,
+    apply_pre_gui_output,
+    qt_hook_confirmation,
+    run_pre_gui_hooks,
+)
 from pymxs import runtime as rt
 from qtpy.QtCore import Qt  # type: ignore
 from qtpy.QtWidgets import QMessageBox  # type: ignore
@@ -280,6 +288,18 @@ def on_create_job_bundle_callback(
     settings.save_sticky_settings()
 
 
+def _pre_gui_hook_confirm_callback(parent):
+    """Choose the confirmation callback for pre-GUI hooks based on the auto_accept setting.
+
+    Returns ``None`` (run hooks without prompting) when ``settings.auto_accept`` is enabled,
+    otherwise the standard Qt confirmation dialog from ``qt_hook_confirmation``. Kept as a small
+    helper so the auto_accept branch can be unit-tested headlessly.
+    """
+    if str2bool(get_setting("settings.auto_accept")):
+        return None
+    return qt_hook_confirmation(parent)
+
+
 def show_job_bundle_submitter():
     """
     Main function that shows the UI.
@@ -290,8 +310,13 @@ def show_job_bundle_submitter():
 
     render_settings = RenderSubmitterUISettings()
 
-    # Set settings dependent on scene
-    render_settings.name = max_utils.get_scene_name()
+    # Set settings dependent on scene. Capture the scene name in a local before
+    # load_sticky_settings() (below) can overwrite render_settings.name with a previously persisted
+    # value: pre-GUI hooks receive this pre-sticky scene name as job_name (see the hook block), so a
+    # read-modify-write hook (e.g. a "STUDIO_" + jobName prefix) stays idempotent across runs instead
+    # of compounding through the sticky settings file.
+    scene_name = max_utils.get_scene_name()
+    render_settings.name = scene_name
     render_settings.frame_list = max_utils.get_frames()
     render_settings.project_path = max_utils.get_scene_path()
 
@@ -309,9 +334,60 @@ def show_job_bundle_submitter():
 
     render_settings.load_sticky_settings()
 
+    # Shared parameter values seed the dialog and are passed to the pre-GUI hooks, so build them first.
+    max_version = get_max_version_year()
+    adaptor_version = ".".join(str(v) for v in adaptor_version_tuple[:2])
+    conda_packages = f"3dsmax={max_version}.* 3dsmax-openjd={adaptor_version}.*"
+
+    shared_parameter_values = {
+        "CondaPackages": conda_packages,
+    }
+
+    # Run pre-GUI hooks (from DEADLINE_HOOKS_DIR, gated by settings.allow_environment_hooks) so
+    # studios can pre-populate the dialog. Runs before the state-set discovery loop below, which
+    # mutates the scene's active state set, so declining or a hook failure aborts without touching it.
+    hook_deadline_params_applied = False
+    try:
+        confirm_callback = _pre_gui_hook_confirm_callback(main_window)
+        pre_gui_output = run_pre_gui_hooks(
+            PreGuiHookContext(
+                bundle_dir=None,
+                # Pre-sticky scene name so read-modify-write hooks stay idempotent across runs.
+                job_name=scene_name,
+                submitter_name=render_settings.submitter_name,
+                priority=render_settings.priority,
+                parameters=dict(shared_parameter_values),
+            ),
+            confirm_callback=confirm_callback,
+        )
+        apply_pre_gui_output(pre_gui_output or {}, render_settings, shared_parameter_values)
+        # Only deadline: params are replayed synchronously during dialog construction, so only they
+        # can make it raise; arm the construction guard below on those alone.
+        hook_deadline_params_applied = any(
+            name.startswith("deadline:")
+            for name in ((pre_gui_output or {}).get("parameters") or {})
+        )
+    except DeadlineOperationCanceled:
+        # User declined the confirmation prompt: abort silently. Must precede DeadlineOperationError,
+        # which it subclasses.
+        return None
+    except DeadlineOperationError:
+        # A hook failed (non-zero exit, timeout, bad JSON/output). Per deadline-cloud's contract a
+        # failing pre-GUI hook blocks the dialog; only this error is caught, so real bugs still raise.
+        _logger.exception("A pre-GUI submission hook failed; the submitter will not open.")
+        QMessageBox.critical(
+            main_window,
+            "AWS Deadline Cloud",
+            "A pre-GUI submission hook failed, so the submitter was not opened. "
+            "See the 3ds Max scripting listener/log for details.",
+        )
+        return None
+
     output_directories: set[str] = set()
 
-    # Add output dir from state set settings if one is set
+    # Add output dir from state set settings if one is set. This sets masterState.CurrentState per
+    # state set, mutating the scene's active state set; the hook block above runs first so its abort
+    # paths don't leave the scene mutated with no dialog open.
     state_sets = max_utils.get_state_set_names()
     for state_set in state_sets:
         rt.execute(
@@ -356,10 +432,6 @@ def show_job_bundle_submitter():
         output_directories=set(render_settings.output_directories),
     )
 
-    max_version = get_max_version_year()
-    adaptor_version = ".".join(str(v) for v in adaptor_version_tuple[:2])
-    conda_packages = f"3dsmax={max_version}.* 3dsmax-openjd={adaptor_version}.*"
-
     submitter_info = SubmitterInfo(
         submitter_name="3dsMax",
         submitter_package_name="deadline-cloud-for-3ds-max",
@@ -368,21 +440,36 @@ def show_job_bundle_submitter():
         host_application_version=str(max_version),
     )
 
-    # Instantiate and show the Submitter UI
-    window = SubmitMaxJobToDeadlineDialog(
-        job_setup_widget_type=SceneSettingsWidget,
-        initial_job_settings=render_settings,
-        initial_shared_parameter_values={
-            "CondaPackages": conda_packages,
-        },
-        auto_detected_attachments=auto_detected_attachments,
-        attachments=attachments,
-        on_create_job_bundle_callback=on_create_job_bundle_callback,
-        parent=main_window,
-        f=Qt.Tool,
-        show_host_requirements_tab=True,
-        submitter_info=submitter_info,
-    )
+    # Instantiate and show the Submitter UI. Only the deadline: params a hook supplied are replayed
+    # during construction, so a bad one raises here: treat that as a hook failure and block. A
+    # construction failure with no hook deadline: params is a real bug, so re-raise. (Non-deadline:
+    # queue params are applied asynchronously later, so this guard can't catch them.)
+    try:
+        window = SubmitMaxJobToDeadlineDialog(
+            job_setup_widget_type=SceneSettingsWidget,
+            initial_job_settings=render_settings,
+            initial_shared_parameter_values=shared_parameter_values,
+            auto_detected_attachments=auto_detected_attachments,
+            attachments=attachments,
+            on_create_job_bundle_callback=on_create_job_bundle_callback,
+            parent=main_window,
+            f=Qt.Tool,
+            show_host_requirements_tab=True,
+            submitter_info=submitter_info,
+        )
+    except Exception:
+        if not hook_deadline_params_applied:
+            raise
+        _logger.exception(
+            "A pre-GUI hook supplied a value the submitter could not use; the submitter will not open."
+        )
+        QMessageBox.critical(
+            main_window,
+            "AWS Deadline Cloud",
+            "A pre-GUI submission hook supplied a value the submitter could not use, so the "
+            "submitter was not opened. See the 3ds Max scripting listener/log for details.",
+        )
+        return None
     window.show()
     return window
 
